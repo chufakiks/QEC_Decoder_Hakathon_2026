@@ -1,34 +1,45 @@
-"""BP+OSD decoder for the [[18,4,4]] memory experiments.
+"""Neural BP decoder with a blossom-matching (or OSD) fallback, for the [[18,4,4]] memory experiments.
 
 Pipeline for one decode() call:
   1. Turn the circuit into a detector error model (DEM): H (detectors x error mechanisms), the observables each
      mechanism flips, and its prior probability. Mechanisms with identical detector and observable sets are merged.
   2. Deduplicate the detector patterns: many shots share a pattern, so each distinct pattern is decoded once.
-  3. For each pattern, run normalised min-sum belief propagation. If BP finds an error set that reproduces the
-     pattern, use it. Otherwise run ordered statistics decoding (OSD-CS): sort the mechanisms by BP's beliefs,
-     find the most reliable independent set by GF(2) elimination, and search single and pair flips of the next
-     most reliable mechanisms for the lowest-cost solution.
-  4. The prediction is the XOR of the observable flips of the chosen mechanisms.
+  3. Run neural min-sum BP: every iteration t scales each check-to-variable message by a trained weight
+     alpha[t, edge] and each prior LLR by a trained weight beta[t, mechanism] (see train_nbp.py; the weights are in
+     nbp_weights.npz). If the hard decision reproduces the detector pattern, BP has converged and its error set gives
+     the prediction.
+  4. If BP is stuck (no valid error set after the last iteration), fall back to
+       FALLBACK = "matching": minimum-weight perfect matching with our own Edmonds blossom implementation
+                              (matching.py), on a graph that keeps the error pieces with at most two detectors, or
+       FALLBACK = "osd":      ordered statistics decoding (OSD-CS) ordered by BP's beliefs, summing the probability
+                              of single- and pair-flip candidates per logical class.
+  5. The prediction is the XOR of the observable flips of the chosen mechanisms.
 
-There are only 70 detectors, so every column of H fits in two 64-bit words and all of the elimination is done
-with bit operations.
-
-Everything numba compiles is warmed up at import, so compilation does not count towards the timed decode calls.
+There are only 70 detectors, so every column of H fits in two 64-bit words and the OSD elimination is done with bit
+operations. Everything numba compiles is warmed up at import, so compilation does not count towards the timed calls.
 """
+import hashlib
+import os
+
 import numpy as np
 import stim
 from numba import njit, prange
 
+from matching import MatchingGraph
+
 # ----------------------------------------------------------------------------------------------------------------
 # Tunable parameters
 # ----------------------------------------------------------------------------------------------------------------
-BP_MAX_ITER = 3          # min-sum iterations before giving up and running OSD
+BP_MAX_ITER = 3          # min-sum iterations when no trained weights are used
 MS_SCALING = 0.5         # normalisation factor of the min-sum check update
 OSD_SINGLES = 2500       # OSD-CS: number of non-pivot columns tried as single flips
 OSD_PAIRS = 150          # OSD-CS: number of non-pivot columns whose pairs are tried
 OSD_TRIPLES = 0          # OSD-CS: number of non-pivot columns whose triples are tried
-ALWAYS_OSD = True        # run OSD even when BP converges
+ALWAYS_OSD = False       # run OSD even when BP converges (needs FALLBACK = "osd")
 POST_AVG = True          # order OSD by the posterior averaged over BP iterations
+USE_NBP = True           # use the trained neural-BP weights (nbp_weights.npz) when they match the circuit
+NBP_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nbp_weights.npz")
+FALLBACK = "matching"    # when BP does not converge: "matching" (blossom MWPM) or "osd" (soft OSD-CS)
 SOFT_OSD = True          # sum candidate probabilities per logical class instead of keeping the single best
 
 
@@ -153,9 +164,13 @@ def _eval(c_lo, c_hi, cost_tab, obs_tab):
 
 @njit(cache=True)
 def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr, weights, obs_masks,
-                rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg,
+                rank_h, alpha_w, beta_w, n_single, n_pair, n_triple, always_osd, soft, post_avg, osd_fallback,
                 v2c, c2v, post, hard):
-    """Decode one syndrome (bool array of length num_det). Returns the 4-bit observable prediction."""
+    """Decode one syndrome (bool array of length num_det).
+
+    Returns the 4-bit observable prediction, or -1 if BP did not converge and osd_fallback is off (the caller then
+    decodes the syndrome with matching). alpha_w[t, e] / beta_w[t, j] are the (trained) weights of iteration t.
+    """
     n_det = chk_ptr.shape[0] - 1
     n = llr.shape[0]
     n_edge = edge_var.shape[0]
@@ -166,6 +181,7 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
     for j in range(n):
         post[j] = llr[j]
     converged = False
+    max_iter = alpha_w.shape[0]
     for it in range(max_iter):
         # check -> variable
         for c in range(n_det):
@@ -188,10 +204,10 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
                 x = v2c[e]
                 s = sgn * (-1.0 if x < 0 else 1.0)
                 mag = m2 if e == arg1 else m1
-                c2v[e] = alpha * s * mag
+                c2v[e] = alpha_w[it, e] * s * mag
         # variable -> check, posterior, hard decision
         for j in range(n):
-            tot = llr[j]
+            tot = beta_w[it, j] * llr[j]
             for k in range(var_ptr[j], var_ptr[j + 1]):
                 tot += c2v[var_order[k]]
             if post_avg:
@@ -222,6 +238,8 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
             if hard[j]:
                 bp_obs ^= obs_masks[j]
         return bp_obs
+    if not converged and not osd_fallback:
+        return -1
 
     # ---------------- OSD-CS ----------------
     order = np.argsort(post)  # most likely errors first
@@ -363,9 +381,9 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
 
 @njit(cache=True, parallel=True)
 def _decode_batch(syns, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr, weights, obs_masks,
-                  rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg):
+                  rank_h, alpha_w, beta_w, n_single, n_pair, n_triple, always_osd, soft, post_avg, osd_fallback):
     m = syns.shape[0]
-    out = np.zeros(m, dtype=np.uint8)
+    out = np.zeros(m, dtype=np.int64)
     n_chunks = min(m, 256)
     n_edge = edge_var.shape[0]
     n = llr.shape[0]
@@ -376,8 +394,8 @@ def _decode_batch(syns, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, l
         hard = np.empty(n, dtype=np.bool_)
         for i in range(ch, m, n_chunks):
             out[i] = _decode_one(syns[i], edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr, weights,
-                                 obs_masks, rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg,
-                                 v2c, c2v, post, hard)
+                                 obs_masks, rank_h, alpha_w, beta_w, n_single, n_pair, n_triple, always_osd, soft, post_avg,
+                                 osd_fallback, v2c, c2v, post, hard)
     return out
 
 
@@ -399,6 +417,16 @@ def _gf2_rank(cols):
 
 
 _MODEL_CACHE = {}
+_MATCHING_CACHE = {}
+_WEIGHTS = None
+
+
+def fingerprint(m):
+    """Identifies an error model, so trained weights are only used with the circuit they were trained on."""
+    h = hashlib.sha1()
+    for k in ("edge_chk", "edge_var", "obs_masks"):
+        h.update(np.ascontiguousarray(m[k]).tobytes())
+    return h.hexdigest()
 
 
 def _model(circuit: stim.Circuit):
@@ -414,6 +442,30 @@ def _model(circuit: stim.Circuit):
     return _MODEL_CACHE[key]
 
 
+def _bp_weights(m):
+    """(alpha_w, beta_w): trained neural-BP weights if available for this error model, else plain min-sum."""
+    global _WEIGHTS
+    if USE_NBP:
+        if _WEIGHTS is None:
+            _WEIGHTS = dict(np.load(NBP_WEIGHTS)) if os.path.exists(NBP_WEIGHTS) else {}
+        fp = fingerprint(m)
+        for b in "XZ":
+            if str(_WEIGHTS.get(f"{b}_fingerprint", "")) == fp:
+                return _WEIGHTS[f"{b}_alpha"], _WEIGHTS[f"{b}_beta"]
+    n_edge, n = len(m["edge_var"]), len(m["llr"])
+    return np.full((BP_MAX_ITER, n_edge), MS_SCALING), np.ones((BP_MAX_ITER, n))
+
+
+def _matching(circuit):
+    key = str(circuit)
+    if key not in _MATCHING_CACHE:
+        _MATCHING_CACHE[key] = MatchingGraph(circuit)
+    return _MATCHING_CACHE[key]
+
+
+LAST_STATS = {}
+
+
 def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
     """
     circuit: the X or Z circuit, loaded with stim.Circuit.from_file.
@@ -421,6 +473,7 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
     Returns a 0/1 array of shape (shots, 4), columns L0 to L3.
     """
     m = _model(circuit)
+    alpha_w, beta_w = _bp_weights(m)
     det = np.ascontiguousarray(np.asarray(detector_events, dtype=bool))
     shots = det.shape[0]
     packed = np.packbits(det, axis=1)
@@ -428,12 +481,20 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
     inverse = inverse.reshape(-1)
     syns = np.unpackbits(uniq, axis=1, count=det.shape[1]).astype(np.bool_)
     nonzero = syns.any(axis=1)
-    obs_u = np.zeros(len(uniq), dtype=np.uint8)
+    obs_u = np.zeros(len(uniq), dtype=np.int64)
     if nonzero.any():
         obs_u[nonzero] = _decode_batch(
             np.ascontiguousarray(syns[nonzero]), m["edge_chk"], m["edge_var"], m["chk_ptr"], m["var_order"],
             m["var_ptr"], m["cols"], m["llr"], m["weights"], m["obs_masks"], m["rank_h"],
-            BP_MAX_ITER, MS_SCALING, OSD_SINGLES, OSD_PAIRS, OSD_TRIPLES, ALWAYS_OSD, SOFT_OSD, POST_AVG)
+            alpha_w, beta_w, OSD_SINGLES, OSD_PAIRS, OSD_TRIPLES, ALWAYS_OSD, SOFT_OSD, POST_AVG,
+            FALLBACK == "osd")
+    stuck = np.flatnonzero(obs_u < 0)
+    if len(stuck):
+        mg = _matching(circuit)
+        for i in stuck:
+            obs_u[i] = mg.decode_syndrome(np.flatnonzero(syns[i]).tolist())
+    LAST_STATS.update(unique=len(uniq), stuck_unique=len(stuck),
+                      stuck_shots=int(np.isin(inverse, stuck).sum()), shots=shots)
     obs = obs_u[inverse]
     out = np.zeros((shots, 4), dtype=np.uint8)
     for k in range(4):
@@ -445,8 +506,14 @@ def _warmup():
     """Compile the numba kernels on a tiny circuit so compilation happens at import, not inside decode()."""
     c = stim.Circuit.generated("repetition_code:memory", rounds=2, distance=3, before_round_data_depolarization=0.01)
     det = c.compile_detector_sampler(seed=0).sample(8)
-    decode(c, det)
+    for fb in ("osd", "matching"):
+        global FALLBACK
+        saved, FALLBACK = FALLBACK, fb
+        decode(c, det)
+        FALLBACK = saved
     _MODEL_CACHE.clear()
+    _MATCHING_CACHE.clear()
 
 
-_warmup()
+if not os.environ.get("NBP_SKIP_WARMUP"):
+    _warmup()
