@@ -38,7 +38,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ.setdefault("NBP_SKIP_WARMUP", "1")
-import decoder as D  # noqa: E402
+import decoder_nbp as D  # noqa: E402
 
 
 # ----------------------------------------------------------------------------------------------------------------
