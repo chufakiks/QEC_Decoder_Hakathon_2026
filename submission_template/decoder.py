@@ -18,6 +18,9 @@ timed decode calls.
 
 LER on all 200,000 labelled shots: 0.0352 on data/train, 0.0346 on data/generated.
 """
+import hashlib
+import os
+
 import numpy as np
 import stim
 from numba import njit, prange
@@ -33,6 +36,8 @@ OSD_TRIPLES = 0          # OSD-CS: number of non-pivot columns whose triples are
 ALWAYS_OSD = True        # run OSD even when BP converges
 POST_AVG = True          # order OSD by the posterior averaged over BP iterations
 SOFT_OSD = True          # sum candidate probabilities per logical class instead of keeping the single best
+USE_ML = True            # apply the learned correction (osd_ml_weights.npz, see train_osd_ml.py) if it matches
+ML_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osd_ml_weights.npz")
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -157,7 +162,7 @@ def _eval(c_lo, c_hi, cost_tab, obs_tab):
 @njit(cache=True)
 def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr, weights, obs_masks,
                 rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg,
-                v2c, c2v, post, hard):
+                v2c, c2v, post, hard, feat):
     """Decode one syndrome (bool array of length num_det). Returns the 4-bit observable prediction."""
     n_det = chk_ptr.shape[0] - 1
     n = llr.shape[0]
@@ -224,6 +229,7 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
         for j in range(n):
             if hard[j]:
                 bp_obs ^= obs_masks[j]
+        _one_hot(feat, bp_obs, 0.0)
         return bp_obs
 
     # ---------------- OSD-CS ----------------
@@ -342,6 +348,7 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
         for i in range(q):
             if costs[i] < costs[best]:
                 best = i
+        _one_hot(feat, obss[best], costs[best])
         return obss[best]
     cmin = costs[0]
     for i in range(q):
@@ -350,6 +357,13 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
     mass = np.zeros(16)
     for i in range(q):
         mass[obss[i]] += np.exp(cmin - costs[i])
+    # Features for the learned correction: log-probability of each logical class and the best candidate's cost.
+    total = 0.0
+    for o in range(16):
+        total += mass[o]
+    for o in range(16):
+        feat[o] = max(np.log(mass[o] / total), -30.0) if mass[o] > 0 else -30.0
+    feat[16] = cmin
     res = 0
     for k in range(4):
         m1 = 0.0
@@ -364,9 +378,17 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
     return res
 
 
+@njit(cache=True)
+def _one_hot(feat, obs, cost):
+    for o in range(16):
+        feat[o] = 0.0 if o == obs else -30.0
+    feat[16] = cost
+
+
 @njit(cache=True, parallel=True)
 def _decode_batch(syns, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr, weights, obs_masks,
-                  rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg):
+                  rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg, feats):
+    """Decode each syndrome; feats[i] receives the 16 class log-probabilities and the best cost."""
     m = syns.shape[0]
     out = np.zeros(m, dtype=np.uint8)
     n_chunks = min(m, 256)
@@ -380,7 +402,7 @@ def _decode_batch(syns, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, l
         for i in range(ch, m, n_chunks):
             out[i] = _decode_one(syns[i], edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr, weights,
                                  obs_masks, rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg,
-                                 v2c, c2v, post, hard)
+                                 v2c, c2v, post, hard, feats[i])
     return out
 
 
@@ -417,31 +439,91 @@ def _model(circuit: stim.Circuit):
     return _MODEL_CACHE[key]
 
 
-def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
-    """
-    circuit: the X or Z circuit, loaded with stim.Circuit.from_file.
-    detector_events: bool array of shape (shots, 70), columns D0 to D69.
-    Returns a 0/1 array of shape (shots, 4), columns L0 to L3.
+def fingerprint(m):
+    """Identifies an error model, so trained weights are only used with the circuit they were trained on."""
+    h = hashlib.sha1()
+    for k in ("edge_chk", "edge_var", "obs_masks"):
+        h.update(np.ascontiguousarray(m[k]).tobytes())
+    return h.hexdigest()
+
+
+def osd_features(circuit: stim.Circuit, detector_events: np.ndarray):
+    """Run BP+OSD on every shot. Returns (features (shots, N_FEAT) float32, OSD prediction (shots, 4) uint8).
+
+    Features: the 70 detector bits, the log-probability OSD assigns to each of the 16 logical classes, the cost
+    (minus log-likelihood ratio) of the best candidate, and the number of fired detectors.
     """
     m = _model(circuit)
     det = np.ascontiguousarray(np.asarray(detector_events, dtype=bool))
-    shots = det.shape[0]
     packed = np.packbits(det, axis=1)
     uniq, inverse = np.unique(packed, axis=0, return_inverse=True)
     inverse = inverse.reshape(-1)
     syns = np.unpackbits(uniq, axis=1, count=det.shape[1]).astype(np.bool_)
     nonzero = syns.any(axis=1)
     obs_u = np.zeros(len(uniq), dtype=np.uint8)
+    feats = np.full((len(uniq), 17), -30.0)
+    feats[:, 0] = 0.0   # an empty syndrome: class 0 (no flips), cost 0
+    feats[:, 16] = 0.0
     if nonzero.any():
+        f = np.empty((int(nonzero.sum()), 17))
         obs_u[nonzero] = _decode_batch(
             np.ascontiguousarray(syns[nonzero]), m["edge_chk"], m["edge_var"], m["chk_ptr"], m["var_order"],
             m["var_ptr"], m["cols"], m["llr"], m["weights"], m["obs_masks"], m["rank_h"],
-            BP_MAX_ITER, MS_SCALING, OSD_SINGLES, OSD_PAIRS, OSD_TRIPLES, ALWAYS_OSD, SOFT_OSD, POST_AVG)
-    obs = obs_u[inverse]
-    out = np.zeros((shots, 4), dtype=np.uint8)
-    for k in range(4):
-        out[:, k] = (obs >> k) & 1
-    return out
+            BP_MAX_ITER, MS_SCALING, OSD_SINGLES, OSD_PAIRS, OSD_TRIPLES, ALWAYS_OSD, SOFT_OSD, POST_AVG, f)
+        feats[nonzero] = f
+    x_u = np.concatenate([syns, feats, syns.sum(axis=1, keepdims=True)], axis=1).astype(np.float32)
+    pred_u = ((obs_u[:, None] >> np.arange(4)) & 1).astype(np.uint8)
+    return x_u[inverse], pred_u[inverse], (x_u, pred_u, inverse)
+
+
+def class_logits(x):
+    """Per-observable log-odds implied by OSD's 16 class log-probabilities (columns 70..85 of the features)."""
+    lp = x[:, 70:86].astype(np.float64)
+    lp = lp - lp.max(axis=1, keepdims=True)
+    p = np.exp(lp)
+    bits = (np.arange(16)[:, None] >> np.arange(4)) & 1  # (16, 4)
+    p1 = p @ bits
+    p0 = p @ (1 - bits)
+    return np.clip(np.log(p1 + 1e-30) - np.log(p0 + 1e-30), -30, 30).astype(np.float32)
+
+
+_ML = None
+
+
+def _ml_weights(m):
+    """The learned correction for this error model, or None."""
+    global _ML
+    if _ML is None:
+        _ML = dict(np.load(ML_WEIGHTS)) if (USE_ML and os.path.exists(ML_WEIGHTS)) else {}
+    fp = fingerprint(m)
+    for b in "XZ":
+        if str(_ML.get(f"{b}_fingerprint", "")) == fp:
+            return {k[2:]: v for k, v in _ML.items() if k.startswith(b + "_")}
+    return None
+
+
+def mlp_logits(w, x):
+    """Numpy forward pass of the correction network: OSD's per-bit log-odds plus a learned residual."""
+    h = (x[:, w["cols"]] - w["mean"]) / w["std"]
+    n_layers = sum(1 for k in w if k.startswith("W"))
+    for i in range(n_layers):
+        h = h @ w[f"W{i}"] + w[f"b{i}"]
+        if i < n_layers - 1:
+            h = np.maximum(h, 0)
+    return class_logits(x) + h
+
+
+def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
+    """
+    circuit: the X or Z circuit, loaded with stim.Circuit.from_file.
+    detector_events: bool array of shape (shots, 70), columns D0 to D69.
+    Returns a 0/1 array of shape (shots, 4), columns L0 to L3.
+    """
+    _, _, (x_u, pred_u, inverse) = osd_features(circuit, detector_events)
+    w = _ml_weights(_model(circuit))
+    if w is not None:
+        pred_u = (mlp_logits(w, x_u) > 0).astype(np.uint8)
+    return pred_u[inverse]
 
 
 def _warmup():
@@ -452,4 +534,5 @@ def _warmup():
     _MODEL_CACHE.clear()
 
 
-_warmup()
+if not os.environ.get("SKIP_WARMUP"):
+    _warmup()
