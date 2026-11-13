@@ -380,19 +380,30 @@ def min_weight_perfect_matching(n, edges):
 # Matching graph from the circuit
 # ----------------------------------------------------------------------------------------------------------------
 WEIGHT_SCALE = 1000  # weights are rounded to integers (in units of 1/1000 of an LLR) for the blossom algorithm
+P_MAX = 0.5 - 1e-6   # posteriors above 1/2 are clipped so that every edge weight stays non-negative
 
 
 class MatchingGraph:
-    def __init__(self, circuit: stim.Circuit):
+    """Matching graph of the detector error model; edge weights from the priors or from per-shot BP posteriors.
+
+    m is the decoder's error model (decoder.extended_model): mechanism j has detectors m["det_lists"][j] and
+    observable mask m["obs_masks"][j]. Stim's decomposition splits each mechanism into graphlike pieces; a piece with
+    three or more detectors (stim cannot split about 9% of the mechanisms here) is split greedily into pairs that
+    are already edges of the graph, and any leftover detector is joined to the boundary (belief-matching's
+    "decompose each hyperedge into edges and redistribute probability mass"). Every piece carries the probability
+    of its mechanism, so reweighting the mechanisms by BP posteriors reweights the graph.
+    """
+
+    def __init__(self, circuit: stim.Circuit, m):
+        n_det = m["base_num_det"]
+        self.n_node = n_det + 1
+        self.boundary = B = n_det
+        index = {(tuple(d), int(o)): j for j, (d, o) in enumerate(zip(m["det_lists"], m["obs_masks"]))}
         dem = circuit.detector_error_model(decompose_errors=True, ignore_decomposition_failures=True)
-        n_det = dem.num_detectors
-        self.boundary = n_det
-        edges = {}  # (u, v) -> [prob, {obs: prob}]
-        self.dropped = 0
+        pieces = []  # (mechanism, detector list, obs)
         for inst in dem.flattened():
             if inst.type != "error":
                 continue
-            p = inst.args_copy()[0]
             comps = [[[], 0]]
             for t in inst.targets_copy():
                 if t.is_separator():
@@ -401,55 +412,114 @@ class MatchingGraph:
                     comps[-1][0].append(t.val)
                 elif t.is_logical_observable_id():
                     comps[-1][1] ^= 1 << t.val
-            for dets, obs in comps:
-                if len(dets) == 0:
-                    continue
-                if len(dets) > 2:
-                    self.dropped += 1
-                    continue
-                u, v = (dets[0], self.boundary) if len(dets) == 1 else tuple(sorted(dets))
-                e = edges.setdefault((u, v), [0.0, {}])
-                e[0] = e[0] * (1 - p) + p * (1 - e[0])
-                e[1][obs] = e[1].get(obs, 0.0) + p
-        n = n_det + 1
+            full, fobs = set(), 0
+            for dets, o in comps:
+                full ^= set(dets)
+                fobs ^= o
+            j = index.get((tuple(sorted(full)), fobs))
+            if j is None:
+                continue  # undetectable mechanism
+            for dets, o in comps:
+                if dets:
+                    pieces.append((j, sorted(set(dets)), o))
+        graphlike = {tuple(d) if len(d) == 2 else (d[0], B) for _, d, _ in pieces if len(d) <= 2}
+        mech, edge, obs = [], [], []
+        self.edge_index = {}
+        self.split = 0
+
+        def add(j, u, v, o):
+            e = self.edge_index.setdefault((min(u, v), max(u, v)), len(self.edge_index))
+            mech.append(j)
+            edge.append(e)
+            obs.append(o)
+
+        for j, dets, o in pieces:
+            if len(dets) == 1:
+                add(j, dets[0], B, o)
+            elif len(dets) == 2:
+                add(j, dets[0], dets[1], o)
+            else:
+                self.split += 1
+                left = list(dets)
+                first = True
+                while left:
+                    a = left.pop(0)
+                    partner = next((b for b in left if (min(a, b), max(a, b)) in graphlike), None)
+                    if partner is None and left:
+                        partner = left[0]
+                    if partner is None:
+                        add(j, a, B, o if first else 0)
+                    else:
+                        left.remove(partner)
+                        add(j, a, partner, o if first else 0)
+                    first = False  # the observable flips go with the first piece
+        self.piece_mech = np.array(mech)
+        self.piece_edge = np.array(edge)
+        self.n_edge = len(self.edge_index)
+        ends = np.array(list(self.edge_index.keys()))
+        self.eu, self.ev = ends[:, 0], ends[:, 1]
+        # Observable flips of an edge: those of its most likely piece under the priors.
+        prior = 1 / (1 + np.exp(m["llr"]))
+        self.prior = prior
+        best = {}
+        for pm, pe, po in zip(mech, edge, obs):
+            if pe not in best or prior[pm] > best[pe][0]:
+                best[pe] = (prior[pm], po)
+        self.edge_obs = np.array([best[e][1] for e in range(self.n_edge)], dtype=np.int64)
+        self.obs_mat = np.zeros((self.n_node, self.n_node), dtype=np.int64)
+        self.obs_mat[self.eu, self.ev] = self.edge_obs
+        self.obs_mat[self.ev, self.eu] = self.edge_obs
+        self.prior_paths = self._all_pairs(self._edge_weights(prior))
+
+    def _edge_weights(self, p_mech):
+        p = np.clip(p_mech, 1e-12, P_MAX)[self.piece_mech]
+        s = np.bincount(self.piece_edge, weights=np.log1p(-2 * p), minlength=self.n_edge)
+        pe = np.clip((1 - np.exp(s)) / 2, 1e-12, P_MAX)  # independent pieces on one edge combine as an XOR
+        return np.log((1 - pe) / pe)
+
+    def _all_pairs(self, w):
+        """Floyd-Warshall over all nodes: (distance, observable flips of the shortest path)."""
+        n = self.n_node
         dist = np.full((n, n), np.inf)
-        obs = np.zeros((n, n), dtype=np.int64)
         np.fill_diagonal(dist, 0)
-        for (u, v), (p, obs_probs) in edges.items():
-            p = min(max(p, 1e-12), 0.5 - 1e-12)
-            w = np.log((1 - p) / p)
-            o = max(obs_probs, key=obs_probs.get)
-            if w < dist[u, v]:
-                dist[u, v] = dist[v, u] = w
-                obs[u, v] = obs[v, u] = o
-        # Floyd-Warshall, carrying the observable flips of the shortest path.
+        dist[self.eu, self.ev] = dist[self.ev, self.eu] = w
+        obs = self.obs_mat.copy()
         for k in range(n):
             via = dist[:, k:k + 1] + dist[k:k + 1, :]
             better = via < dist
             dist = np.where(better, via, dist)
             obs = np.where(better, obs[:, k:k + 1] ^ obs[k:k + 1, :], obs)
-        self.dist = np.where(np.isfinite(dist), np.round(dist * WEIGHT_SCALE), 10 ** 9).astype(np.int64)
-        self.obs = obs
+        return dist, obs
 
-    def decode_syndrome(self, fired):
-        """fired: list of fired detector indices. Returns the 4-bit observable prediction."""
+    def decode_syndrome(self, fired, posterior_llr=None):
+        """fired: indices of fired detectors. posterior_llr: BP posteriors per mechanism (None = use priors).
+        Returns the 4-bit observable prediction."""
+        fired = [int(f) for f in fired]
         k = len(fired)
         if k == 0:
             return 0
         B = self.boundary
-        d = self.dist
+        if posterior_llr is None:
+            dist, obs = self.prior_paths
+            D = dist[np.ix_(fired + [B], fired + [B])]
+            O = obs[np.ix_(fired + [B], fired + [B])]
+        else:
+            dist, obs = self._all_pairs(self._edge_weights(1 / (1 + np.exp(posterior_llr))))
+            D = dist[np.ix_(fired + [B], fired + [B])]
+            O = obs[np.ix_(fired + [B], fired + [B])]
+        D = np.where(np.isfinite(D), np.round(D * WEIGHT_SCALE), 10 ** 9).astype(np.int64)
         edges = []
         for a in range(k):
-            edges.append((a, k + a, int(d[fired[a], B])))
+            edges.append((a, k + a, int(D[a, k])))
             for b in range(a + 1, k):
-                edges.append((a, b, int(d[fired[a], fired[b]])))
+                edges.append((a, b, int(D[a, b])))
                 edges.append((k + a, k + b, 0))
         mate = min_weight_perfect_matching(2 * k, edges)
         res = 0
         for a in range(k):
-            m = mate[a]
-            if m == k + a:
-                res ^= int(self.obs[fired[a], B])
-            elif m < k and m > a:
-                res ^= int(self.obs[fired[a], fired[m]])
+            mt = mate[a]
+            if mt == k + a:
+                res ^= int(O[a, k])
+            elif a < mt < k:
+                res ^= int(O[a, mt])
         return res
