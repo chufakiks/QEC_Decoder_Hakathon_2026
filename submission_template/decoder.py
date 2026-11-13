@@ -1,26 +1,24 @@
-"""BP+OSD decoder for the [[18,4,4]] memory experiments: plain 3-iteration min-sum BP, then OSD on every shot.
+"""BP+OSD decoder for the [[18,4,4]] memory experiments, with OSD started from several BP rankings.
 
 Pipeline for one decode() call:
   1. Turn the circuit into a detector error model (DEM): H (detectors x error mechanisms), the observables each
      mechanism flips, and its prior probability. Mechanisms with identical detector and observable sets are merged.
   2. Deduplicate the detector patterns: many shots share a pattern, so each distinct pattern is decoded once.
-  3. Run 3 iterations of normalised min-sum BP (scaling 0.5) and average the posterior LLRs over the iterations.
-     BP is only used to rank the mechanisms: a few iterations rank better than a fully converged run.
-  4. OSD-CS on every pattern, whether or not BP converged: sort the mechanisms by BP's averaged beliefs, take the
-     most reliable independent set (GF(2) elimination) as the base solution, and also try every single flip and
-     the pairs among the 150 most reliable remaining mechanisms (about 13,600 candidates). Each candidate is scored
-     by its prior probability, the probabilities are summed per logical class, and each of the 4 observables is
-     predicted by majority of that probability.
+  3. Run normalised min-sum BP (scaling 0.5) for max(RANKINGS) iterations, keeping the posterior LLRs averaged over
+     the first t iterations for every t in RANKINGS (default 1, 3 and 5). BP is only used to rank the mechanisms.
+  4. For each of those rankings, run OSD-CS: take the most reliable independent set of mechanisms (GF(2)
+     elimination) as the base solution and also try every single flip and the pairs among the 150 most reliable
+     remaining mechanisms (about 13,600 candidate error sets per ranking).
+  5. Merge the candidates of all rankings (the same error set found twice is counted once, via a 64-bit Zobrist
+     hash), add up their prior probabilities per logical class, and predict each of the 4 observables by majority
+     of that probability.
 
 There are only 70 detectors, so every column of H fits in two 64-bit words and all of the elimination is done
 with bit operations. Everything numba compiles is warmed up at import, so compilation does not count towards the
 timed decode calls.
 
-LER on all 200,000 labelled shots: 0.0352 on data/train, 0.0346 on data/generated.
+LER on all 200,000 labelled shots of data/train: 0.0348 with RANKINGS = (1, 3, 5), 0.0352 with (3,).
 """
-import hashlib
-import os
-
 import numpy as np
 import stim
 from numba import njit, prange
@@ -28,16 +26,10 @@ from numba import njit, prange
 # ----------------------------------------------------------------------------------------------------------------
 # Tunable parameters
 # ----------------------------------------------------------------------------------------------------------------
-BP_MAX_ITER = 3          # min-sum iterations before giving up and running OSD
+RANKINGS = (1, 3, 5)     # OSD runs from the BP posteriors averaged over the first t iterations, for each t
 MS_SCALING = 0.5         # normalisation factor of the min-sum check update
-OSD_SINGLES = 2500       # OSD-CS: number of non-pivot columns tried as single flips
+OSD_SINGLES = 2500       # OSD-CS: number of non-pivot columns tried as single flips (2,500 = all of them)
 OSD_PAIRS = 150          # OSD-CS: number of non-pivot columns whose pairs are tried
-OSD_TRIPLES = 0          # OSD-CS: number of non-pivot columns whose triples are tried
-ALWAYS_OSD = True        # run OSD even when BP converges
-POST_AVG = True          # order OSD by the posterior averaged over BP iterations
-SOFT_OSD = True          # sum candidate probabilities per logical class instead of keeping the single best
-USE_ML = True            # apply the learned correction (osd_ml_weights.npz, see train_osd_ml.py) if it matches
-ML_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osd_ml_weights.npz")
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -122,11 +114,12 @@ def _lowest_bit(lo, hi):
 
 
 @njit(cache=True)
-def _build_tables(rank, piv_col, weights, obs_masks, cost_tab, obs_tab):
-    """cost_tab[b, v] / obs_tab[b, v]: total weight / observable XOR of the pivots selected by byte b of a mask."""
+def _build_tables(rank, piv_col, weights, obs_masks, zob, cost_tab, obs_tab, zob_tab):
+    """For byte b of a pivot bitmask with value v: total weight, observable XOR and Zobrist hash of those pivots."""
     for b in range(cost_tab.shape[0]):
         cost_tab[b, 0] = 0.0
         obs_tab[b, 0] = 0
+        zob_tab[b, 0] = 0
         for v in range(1, 256):
             low = v & (-v)
             k = 0
@@ -138,102 +131,36 @@ def _build_tables(rank, piv_col, weights, obs_masks, cost_tab, obs_tab):
                 j = piv_col[p]
                 cost_tab[b, v] = cost_tab[b, prev] + weights[j]
                 obs_tab[b, v] = obs_tab[b, prev] ^ obs_masks[j]
+                zob_tab[b, v] = zob_tab[b, prev] ^ zob[j]
             else:
                 cost_tab[b, v] = cost_tab[b, prev]
                 obs_tab[b, v] = obs_tab[b, prev]
+                zob_tab[b, v] = zob_tab[b, prev]
 
 
 @njit(cache=True, inline="always")
-def _eval(c_lo, c_hi, cost_tab, obs_tab):
+def _eval(c_lo, c_hi, cost_tab, obs_tab, zob_tab):
     cost = 0.0
     obs = 0
+    z = np.uint64(0)
     m = np.uint64(255)
-    for b in range(8):
-        v = (c_lo >> np.uint64(8 * b)) & m
+    for b in range(cost_tab.shape[0]):
+        if b < 8:
+            v = (c_lo >> np.uint64(8 * b)) & m
+        else:
+            v = (c_hi >> np.uint64(8 * (b - 8))) & m
         cost += cost_tab[b, v]
         obs ^= obs_tab[b, v]
-    for b in range(8, cost_tab.shape[0]):
-        v = (c_hi >> np.uint64(8 * (b - 8))) & m
-        cost += cost_tab[b, v]
-        obs ^= obs_tab[b, v]
-    return cost, obs
+        z ^= zob_tab[b, v]
+    return cost, obs, z
 
 
 @njit(cache=True)
-def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr, weights, obs_masks,
-                rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg,
-                v2c, c2v, post, hard, feat):
-    """Decode one syndrome (bool array of length num_det). Returns the 4-bit observable prediction."""
-    n_det = chk_ptr.shape[0] - 1
-    n = llr.shape[0]
-    n_edge = edge_var.shape[0]
-
-    # ---------------- belief propagation (normalised min-sum) ----------------
-    for e in range(n_edge):
-        v2c[e] = llr[edge_var[e]]
-    for j in range(n):
-        post[j] = llr[j]
-    converged = False
-    for it in range(max_iter):
-        # check -> variable
-        for c in range(n_det):
-            sgn = -1.0 if syn[c] else 1.0
-            m1 = 1e300
-            m2 = 1e300
-            arg1 = -1
-            for e in range(chk_ptr[c], chk_ptr[c + 1]):
-                x = v2c[e]
-                if x < 0:
-                    sgn = -sgn
-                    x = -x
-                if x < m1:
-                    m2 = m1
-                    m1 = x
-                    arg1 = e
-                elif x < m2:
-                    m2 = x
-            for e in range(chk_ptr[c], chk_ptr[c + 1]):
-                x = v2c[e]
-                s = sgn * (-1.0 if x < 0 else 1.0)
-                mag = m2 if e == arg1 else m1
-                c2v[e] = alpha * s * mag
-        # variable -> check, posterior, hard decision
-        for j in range(n):
-            tot = llr[j]
-            for k in range(var_ptr[j], var_ptr[j + 1]):
-                tot += c2v[var_order[k]]
-            if post_avg:
-                post[j] = (post[j] * it + tot) / (it + 1) if it > 0 else tot
-            else:
-                post[j] = tot
-            hard[j] = tot < 0
-            for k in range(var_ptr[j], var_ptr[j + 1]):
-                e = var_order[k]
-                v2c[e] = tot - c2v[e]
-        # syndrome check
-        ok = True
-        for c in range(n_det):
-            par = syn[c]
-            for e in range(chk_ptr[c], chk_ptr[c + 1]):
-                if hard[edge_var[e]]:
-                    par = not par
-            if par:
-                ok = False
-                break
-        if ok:
-            converged = True
-            break
-
-    if converged and not always_osd:
-        bp_obs = 0
-        for j in range(n):
-            if hard[j]:
-                bp_obs ^= obs_masks[j]
-        _one_hot(feat, bp_obs, 0.0)
-        return bp_obs
-
-    # ---------------- OSD-CS ----------------
-    order = np.argsort(post)  # most likely errors first
+def _osd_candidates(post, syn, cols, weights, obs_masks, zob, rank_h, n_single, n_pair, costs, obss, hashes, q):
+    """OSD-CS from the ranking given by post (most likely first). Appends candidates from index q; returns new q."""
+    n = post.shape[0]
+    n_det = syn.shape[0]
+    order = np.argsort(post)
     piv_lo = np.zeros(rank_h, dtype=np.uint64)
     piv_hi = np.zeros(rank_h, dtype=np.uint64)
     pc_lo = np.zeros(rank_h, dtype=np.uint64)   # which pivots (by index) make up each reduced pivot vector
@@ -241,7 +168,7 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
     piv_bit = np.zeros(rank_h, dtype=np.int64)
     piv_col = np.zeros(rank_h, dtype=np.int64)
     nonpiv = np.empty(n_single, dtype=np.int64)
-    np_lo = np.zeros(n_single, dtype=np.uint64)  # representation of each non-pivot column in the pivot basis
+    np_lo = np.zeros(n_single, dtype=np.uint64)  # each non-pivot column written in the pivot basis
     np_hi = np.zeros(n_single, dtype=np.uint64)
     n_np = 0
     rank = 0
@@ -273,18 +200,13 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
                 piv_bit[rank] = _lowest_bit(v_lo, v_hi)
                 piv_col[rank] = j
                 rank += 1
-        else:
-            # Dependent column: only columns after the information set is complete are proper OSD candidates,
-            # but dependent columns found earlier are just as valid (and more reliable).
-            if n_np < n_single:
-                nonpiv[n_np] = j
-                np_lo[n_np] = c_lo
-                np_hi[n_np] = c_hi
-                n_np += 1
-    # Columns seen before the basis was complete may need re-expressing? No: a dependent column's representation
-    # only uses pivots that existed when it was reduced, and those pivots never change afterwards.
-
-    # Syndrome in the pivot basis.
+        elif n_np < n_single:
+            # A dependent column's representation only uses pivots that already existed, which never change.
+            nonpiv[n_np] = j
+            np_lo[n_np] = c_lo
+            np_hi[n_np] = c_hi
+            n_np += 1
+    # The syndrome in the pivot basis: the base solution.
     s_lo = np.uint64(0)
     s_hi = np.uint64(0)
     for c in range(n_det):
@@ -301,69 +223,112 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
             s_hi ^= piv_hi[k]
             cs_lo ^= pc_lo[k]
             cs_hi ^= pc_hi[k]
-
-    # Enumerate candidate error sets (base solution, single and pair flips of non-pivot columns, triples among the
-    # first few) and add up their probability per logical class. Each candidate is a distinct error set, so the
-    # sums approximate the probability of each of the 16 observable outcomes.
-    n_bytes = (rank + 7) // 8
-    if n_bytes < 9:
-        n_bytes = 9
-    cost_tab = np.empty((n_bytes, 256))
-    obs_tab = np.empty((n_bytes, 256), dtype=np.int64)
-    _build_tables(rank, piv_col, weights, obs_masks, cost_tab, obs_tab)
-    n_p = min(n_pair, n_np)
-    n_t = min(n_triple, n_np)
-    n_cand = 1 + n_np + n_p * (n_p - 1) // 2 + n_t * (n_t - 1) * (n_t - 2) // 6
-    costs = np.empty(n_cand)
-    obss = np.empty(n_cand, dtype=np.int64)
-    q = 0
-    cost, obs = _eval(cs_lo, cs_hi, cost_tab, obs_tab)
-    costs[q] = cost
-    obss[q] = obs
+    nb = max(9, (rank + 7) // 8)
+    cost_tab = np.empty((nb, 256))
+    obs_tab = np.empty((nb, 256), dtype=np.int64)
+    zob_tab = np.empty((nb, 256), dtype=np.uint64)
+    _build_tables(rank, piv_col, weights, obs_masks, zob, cost_tab, obs_tab, zob_tab)
+    c, o, z = _eval(cs_lo, cs_hi, cost_tab, obs_tab, zob_tab)
+    costs[q] = c
+    obss[q] = o
+    hashes[q] = z
     q += 1
     for a in range(n_np):
         ja = nonpiv[a]
-        cost, obs = _eval(cs_lo ^ np_lo[a], cs_hi ^ np_hi[a], cost_tab, obs_tab)
-        costs[q] = cost + weights[ja]
-        obss[q] = obs ^ obs_masks[ja]
+        c, o, z = _eval(cs_lo ^ np_lo[a], cs_hi ^ np_hi[a], cost_tab, obs_tab, zob_tab)
+        costs[q] = c + weights[ja]
+        obss[q] = o ^ obs_masks[ja]
+        hashes[q] = z ^ zob[ja]
         q += 1
+    n_p = min(n_pair, n_np)
     for a in range(n_p):
         for b in range(a + 1, n_p):
             ja = nonpiv[a]
             jb = nonpiv[b]
-            cost, obs = _eval(cs_lo ^ np_lo[a] ^ np_lo[b], cs_hi ^ np_hi[a] ^ np_hi[b], cost_tab, obs_tab)
-            costs[q] = cost + weights[ja] + weights[jb]
-            obss[q] = obs ^ obs_masks[ja] ^ obs_masks[jb]
+            c, o, z = _eval(cs_lo ^ np_lo[a] ^ np_lo[b], cs_hi ^ np_hi[a] ^ np_hi[b], cost_tab, obs_tab, zob_tab)
+            costs[q] = c + weights[ja] + weights[jb]
+            obss[q] = o ^ obs_masks[ja] ^ obs_masks[jb]
+            hashes[q] = z ^ zob[ja] ^ zob[jb]
             q += 1
-    for a in range(n_t):
-        for b in range(a + 1, n_t):
-            for c in range(b + 1, n_t):
-                cost, obs = _eval(cs_lo ^ np_lo[a] ^ np_lo[b] ^ np_lo[c],
-                                           cs_hi ^ np_hi[a] ^ np_hi[b] ^ np_hi[c], cost_tab, obs_tab)
-                costs[q] = cost + weights[nonpiv[a]] + weights[nonpiv[b]] + weights[nonpiv[c]]
-                obss[q] = obs ^ obs_masks[nonpiv[a]] ^ obs_masks[nonpiv[b]] ^ obs_masks[nonpiv[c]]
-                q += 1
-    if not soft:
-        best = 0
-        for i in range(q):
-            if costs[i] < costs[best]:
-                best = i
-        _one_hot(feat, obss[best], costs[best])
-        return obss[best]
-    cmin = costs[0]
+    return q
+
+
+@njit(cache=True)
+def _decode_one(syn, edge_var, chk_ptr, var_order, var_ptr, cols, llr, obs_masks, zob, rank_h, alpha, rankings,
+                n_single, n_pair, v2c, c2v, post, snaps, costs, obss, hashes, table, stamp, cur):
+    """Decode one syndrome. Returns the 4-bit observable prediction."""
+    n = llr.shape[0]
+    n_det = chk_ptr.shape[0] - 1
+    n_rank = rankings.shape[0]
+    max_it = 0
+    for r in range(n_rank):
+        if rankings[r] > max_it:
+            max_it = rankings[r]
+
+    # ---------------- min-sum BP; keep the averaged posterior after each requested iteration ----------------
+    for e in range(edge_var.shape[0]):
+        v2c[e] = llr[edge_var[e]]
+    for it in range(max_it):
+        for c in range(n_det):
+            sgn = -1.0 if syn[c] else 1.0
+            m1 = 1e300
+            m2 = 1e300
+            arg1 = -1
+            for e in range(chk_ptr[c], chk_ptr[c + 1]):
+                x = v2c[e]
+                if x < 0:
+                    sgn = -sgn
+                    x = -x
+                if x < m1:
+                    m2 = m1
+                    m1 = x
+                    arg1 = e
+                elif x < m2:
+                    m2 = x
+            for e in range(chk_ptr[c], chk_ptr[c + 1]):
+                x = v2c[e]
+                s = sgn * (-1.0 if x < 0 else 1.0)
+                c2v[e] = alpha * s * (m2 if e == arg1 else m1)
+        for j in range(n):
+            tot = llr[j]
+            for k in range(var_ptr[j], var_ptr[j + 1]):
+                tot += c2v[var_order[k]]
+            post[j] = (post[j] * it + tot) / (it + 1) if it > 0 else tot
+            for k in range(var_ptr[j], var_ptr[j + 1]):
+                e = var_order[k]
+                v2c[e] = tot - c2v[e]
+        for r in range(n_rank):
+            if rankings[r] == it + 1:
+                snaps[r] = post
+
+    # ---------------- OSD-CS from every ranking ----------------
+    q = 0
+    for r in range(n_rank):
+        q = _osd_candidates(snaps[r], syn, cols, llr, obs_masks, zob, rank_h, n_single, n_pair,
+                            costs, obss, hashes, q)
+
+    # ---------------- probability per logical class, each distinct error set counted once ----------------
+    cmin = 1e300
     for i in range(q):
         if costs[i] < cmin:
             cmin = costs[i]
+    mask = table.shape[0] - 1
     mass = np.zeros(16)
     for i in range(q):
+        if n_rank > 1:
+            h = hashes[i]
+            slot = np.int64(h & np.uint64(mask))
+            dup = False
+            while stamp[slot] == cur:
+                if table[slot] == h:
+                    dup = True
+                    break
+                slot = (slot + 1) & mask
+            if dup:
+                continue
+            stamp[slot] = cur
+            table[slot] = h
         mass[obss[i]] += np.exp(cmin - costs[i])
-    # Features for the learned correction: log-probability of each logical class and the best candidate's cost.
-    total = 0.0
-    for o in range(16):
-        total += mass[o]
-    for o in range(16):
-        feat[o] = max(np.log(mass[o] / total), -30.0) if mass[o] > 0 else -30.0
-    feat[16] = cmin
     res = 0
     for k in range(4):
         m1 = 0.0
@@ -378,31 +343,34 @@ def _decode_one(syn, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr,
     return res
 
 
-@njit(cache=True)
-def _one_hot(feat, obs, cost):
-    for o in range(16):
-        feat[o] = 0.0 if o == obs else -30.0
-    feat[16] = cost
-
-
 @njit(cache=True, parallel=True)
-def _decode_batch(syns, edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr, weights, obs_masks,
-                  rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg, feats):
-    """Decode each syndrome; feats[i] receives the 16 class log-probabilities and the best cost."""
+def _decode_batch(syns, edge_var, chk_ptr, var_order, var_ptr, cols, llr, obs_masks, zob, rank_h, alpha, rankings,
+                  n_single, n_pair):
     m = syns.shape[0]
     out = np.zeros(m, dtype=np.uint8)
     n_chunks = min(m, 256)
     n_edge = edge_var.shape[0]
     n = llr.shape[0]
+    cap = rankings.shape[0] * (1 + n_single + n_pair * (n_pair - 1) // 2)
+    size = 1
+    while size < 2 * cap:
+        size *= 2
     for ch in prange(n_chunks):
         v2c = np.empty(n_edge)
         c2v = np.empty(n_edge)
         post = np.empty(n)
-        hard = np.empty(n, dtype=np.bool_)
+        snaps = np.empty((rankings.shape[0], n))
+        costs = np.empty(cap)
+        obss = np.empty(cap, dtype=np.int64)
+        hashes = np.empty(cap, dtype=np.uint64)
+        table = np.empty(size, dtype=np.uint64)   # open-addressing hash set; a slot is in use if stamp == cur
+        stamp = np.zeros(size, dtype=np.int64)
+        cur = 0
         for i in range(ch, m, n_chunks):
-            out[i] = _decode_one(syns[i], edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols, llr, weights,
-                                 obs_masks, rank_h, max_iter, alpha, n_single, n_pair, n_triple, always_osd, soft, post_avg,
-                                 v2c, c2v, post, hard, feats[i])
+            cur += 1
+            out[i] = _decode_one(syns[i], edge_var, chk_ptr, var_order, var_ptr, cols, llr, obs_masks, zob, rank_h,
+                                 alpha, rankings, n_single, n_pair, v2c, c2v, post, snaps, costs, obss, hashes,
+                                 table, stamp, cur)
     return out
 
 
@@ -433,84 +401,10 @@ def _model(circuit: stim.Circuit):
         edge_chk, edge_var, chk_ptr, var_order, var_ptr, cols = build_graph(det_lists, num_det)
         priors = np.clip(priors, 1e-12, 0.5 - 1e-12)
         llr = np.log((1 - priors) / priors)
-        _MODEL_CACHE[key] = dict(edge_chk=edge_chk, edge_var=edge_var, chk_ptr=chk_ptr, var_order=var_order,
-                                 var_ptr=var_ptr, cols=cols, llr=llr, weights=llr.copy(), obs_masks=obs_masks,
-                                 rank_h=_gf2_rank(cols), num_det=num_det)
+        zob = np.random.default_rng(12345).integers(0, 2 ** 63, size=len(llr), dtype=np.int64).astype(np.uint64)
+        _MODEL_CACHE[key] = dict(edge_var=edge_var, chk_ptr=chk_ptr, var_order=var_order, var_ptr=var_ptr,
+                                 cols=cols, llr=llr, obs_masks=obs_masks, zob=zob, rank_h=_gf2_rank(cols))
     return _MODEL_CACHE[key]
-
-
-def fingerprint(m):
-    """Identifies an error model, so trained weights are only used with the circuit they were trained on."""
-    h = hashlib.sha1()
-    for k in ("edge_chk", "edge_var", "obs_masks"):
-        h.update(np.ascontiguousarray(m[k]).tobytes())
-    return h.hexdigest()
-
-
-def osd_features(circuit: stim.Circuit, detector_events: np.ndarray):
-    """Run BP+OSD on every shot. Returns (features (shots, N_FEAT) float32, OSD prediction (shots, 4) uint8).
-
-    Features: the 70 detector bits, the log-probability OSD assigns to each of the 16 logical classes, the cost
-    (minus log-likelihood ratio) of the best candidate, and the number of fired detectors.
-    """
-    m = _model(circuit)
-    det = np.ascontiguousarray(np.asarray(detector_events, dtype=bool))
-    packed = np.packbits(det, axis=1)
-    uniq, inverse = np.unique(packed, axis=0, return_inverse=True)
-    inverse = inverse.reshape(-1)
-    syns = np.unpackbits(uniq, axis=1, count=det.shape[1]).astype(np.bool_)
-    nonzero = syns.any(axis=1)
-    obs_u = np.zeros(len(uniq), dtype=np.uint8)
-    feats = np.full((len(uniq), 17), -30.0)
-    feats[:, 0] = 0.0   # an empty syndrome: class 0 (no flips), cost 0
-    feats[:, 16] = 0.0
-    if nonzero.any():
-        f = np.empty((int(nonzero.sum()), 17))
-        obs_u[nonzero] = _decode_batch(
-            np.ascontiguousarray(syns[nonzero]), m["edge_chk"], m["edge_var"], m["chk_ptr"], m["var_order"],
-            m["var_ptr"], m["cols"], m["llr"], m["weights"], m["obs_masks"], m["rank_h"],
-            BP_MAX_ITER, MS_SCALING, OSD_SINGLES, OSD_PAIRS, OSD_TRIPLES, ALWAYS_OSD, SOFT_OSD, POST_AVG, f)
-        feats[nonzero] = f
-    x_u = np.concatenate([syns, feats, syns.sum(axis=1, keepdims=True)], axis=1).astype(np.float32)
-    pred_u = ((obs_u[:, None] >> np.arange(4)) & 1).astype(np.uint8)
-    return x_u[inverse], pred_u[inverse], (x_u, pred_u, inverse)
-
-
-def class_logits(x):
-    """Per-observable log-odds implied by OSD's 16 class log-probabilities (columns 70..85 of the features)."""
-    lp = x[:, 70:86].astype(np.float64)
-    lp = lp - lp.max(axis=1, keepdims=True)
-    p = np.exp(lp)
-    bits = (np.arange(16)[:, None] >> np.arange(4)) & 1  # (16, 4)
-    p1 = p @ bits
-    p0 = p @ (1 - bits)
-    return np.clip(np.log(p1 + 1e-30) - np.log(p0 + 1e-30), -30, 30).astype(np.float32)
-
-
-_ML = None
-
-
-def _ml_weights(m):
-    """The learned correction for this error model, or None."""
-    global _ML
-    if _ML is None:
-        _ML = dict(np.load(ML_WEIGHTS)) if (USE_ML and os.path.exists(ML_WEIGHTS)) else {}
-    fp = fingerprint(m)
-    for b in "XZ":
-        if str(_ML.get(f"{b}_fingerprint", "")) == fp:
-            return {k[2:]: v for k, v in _ML.items() if k.startswith(b + "_")}
-    return None
-
-
-def mlp_logits(w, x):
-    """Numpy forward pass of the correction network: OSD's per-bit log-odds plus a learned residual."""
-    h = (x[:, w["cols"]] - w["mean"]) / w["std"]
-    n_layers = sum(1 for k in w if k.startswith("W"))
-    for i in range(n_layers):
-        h = h @ w[f"W{i}"] + w[f"b{i}"]
-        if i < n_layers - 1:
-            h = np.maximum(h, 0)
-    return class_logits(x) + h
 
 
 def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
@@ -519,11 +413,20 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
     detector_events: bool array of shape (shots, 70), columns D0 to D69.
     Returns a 0/1 array of shape (shots, 4), columns L0 to L3.
     """
-    _, _, (x_u, pred_u, inverse) = osd_features(circuit, detector_events)
-    w = _ml_weights(_model(circuit))
-    if w is not None:
-        pred_u = (mlp_logits(w, x_u) > 0).astype(np.uint8)
-    return pred_u[inverse]
+    m = _model(circuit)
+    det = np.ascontiguousarray(np.asarray(detector_events, dtype=bool))
+    packed = np.packbits(det, axis=1)
+    uniq, inverse = np.unique(packed, axis=0, return_inverse=True)
+    syns = np.unpackbits(uniq, axis=1, count=det.shape[1]).astype(np.bool_)
+    nonzero = syns.any(axis=1)
+    obs_u = np.zeros(len(uniq), dtype=np.uint8)
+    if nonzero.any():
+        obs_u[nonzero] = _decode_batch(
+            np.ascontiguousarray(syns[nonzero]), m["edge_var"], m["chk_ptr"], m["var_order"], m["var_ptr"],
+            m["cols"], m["llr"], m["obs_masks"], m["zob"], m["rank_h"], MS_SCALING,
+            np.array(RANKINGS, dtype=np.int64), min(OSD_SINGLES, len(m["llr"])), OSD_PAIRS)
+    obs = obs_u[inverse.reshape(-1)]
+    return ((obs[:, None] >> np.arange(4)) & 1).astype(np.uint8)
 
 
 def _warmup():
@@ -534,5 +437,4 @@ def _warmup():
     _MODEL_CACHE.clear()
 
 
-if not os.environ.get("SKIP_WARMUP"):
-    _warmup()
+_warmup()
